@@ -15,10 +15,16 @@ from solders.rpc.config import RpcSendTransactionConfig
 from solders.rpc.responses import SendTransactionResp
 from solders.signature import Signature
 from solders.transaction import VersionedTransaction
-
+from solders.pubkey import Pubkey
 from solana.rpc.async_api import AsyncClient
 from solana.rpc.types import TxOpts
 from solana.rpc.commitment import Processed
+
+try:
+    import orjson as json  # pip install orjson
+except Exception:
+    import json
+
 
 # -------- ENV --------
 load_dotenv()
@@ -32,6 +38,10 @@ COMPUTE_UNIT_LIMIT = int(os.getenv("COMPUTE_UNIT_LIMIT", "600000"))
 DRY_RUN = os.getenv("DRY_RUN", "false").lower() == "true"
 JITO_URL = os.getenv("JITO_URL", "https://ny.mainnet.block-engine.jito.wtf/api/v1/transactions")
 JITO_AUTH = os.getenv("JITO_AUTH")  # optional UUID token; not required for default rate limits
+
+HOLDERS_WINDOW_MS = int(os.getenv("HOLDERS_WINDOW_MS", "60000"))
+HOLDERS_POLL_MS   = int(os.getenv("HOLDERS_POLL_MS", "120"))
+
 
 # Pump.fun program id
 PUMP_PROGRAM_ID = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
@@ -51,34 +61,38 @@ def b58_keypair_from_secret(secret_b58: str) -> Keypair:
     return Keypair.from_bytes(sk)
 
 def parse_create_instruction(data: bytes) -> Optional[Dict[str, Any]]:
-    """Same structure as your listener; kept here for self-containment."""
-    if len(data) < 8:
-        return None
-    offset = 8
-    parsed_data = {}
-    fields = [
-        ("name", "string"),
-        ("symbol", "string"),
-        ("uri", "string"),
-        ("mint", "publicKey"),
-        ("bondingCurve", "publicKey"),
-        ("user", "publicKey"),
-        ("creator", "publicKey"),
-    ]
+    """
+    Minimal parser: skip string decoding (name/symbol/uri), only return
+    mint, bondingCurve, creator as base58. Much lighter on the hot path.
+    """
     try:
-        for field_name, field_type in fields:
-            if field_type == "string":
-                length = struct.unpack("<I", data[offset: offset + 4])[0]
-                offset += 4
-                value = data[offset: offset + length].decode("utf-8")
-                offset += length
-            elif field_type == "publicKey":
-                value = base58.b58encode(data[offset: offset + 32]).decode("utf-8")
-                offset += 32
-            parsed_data[field_name] = value
-        return parsed_data
+        if len(data) < 8:
+            return None
+        o = 8  # skip 8-byte method discriminator
+
+        # skip name (string)
+        if o + 4 > len(data): return None
+        L = struct.unpack_from("<I", data, o)[0]; o += 4 + L
+
+        # skip symbol (string)
+        if o + 4 > len(data): return None
+        L = struct.unpack_from("<I", data, o)[0]; o += 4 + L
+
+        # skip uri (string)
+        if o + 4 > len(data): return None
+        L = struct.unpack_from("<I", data, o)[0]; o += 4 + L
+
+        # mint (32), bondingCurve (32), user (32), creator (32)
+        if o + 32*4 > len(data): return None
+        mint_b58   = base58.b58encode(data[o:o+32]).decode("ascii"); o += 32
+        bc_b58     = base58.b58encode(data[o:o+32]).decode("ascii"); o += 32
+        o += 32  # skip user
+        creator_b58= base58.b58encode(data[o:o+32]).decode("ascii"); o += 32
+
+        return {"mint": mint_b58, "bondingCurve": bc_b58, "creator": creator_b58}
     except Exception:
         return None
+
 
 def _tx_to_bytes(tx) -> bytes:
     # solana-py VersionedTransaction has .serialize()
@@ -343,19 +357,25 @@ async def listen_and_buy():
                         continue
 
 
+                    # ... after you've found `encoded` ...
+
                     try:
-                        decoded = base64.b64decode(encoded)
+                        # faster base64 (no strict validate)
+                        decoded = base64.b64decode(encoded, validate=False)
+
                         parsed = parse_create_instruction(decoded)
                         if not parsed or "mint" not in parsed or "bondingCurve" not in parsed:
                             continue
 
                         ev = CreateEvent.from_parsed(value.get("signature", ""), parsed)
-                        # Log the detection & fire buy immediately
                         print(f"[{now_ms()}] [CREATE] sig={ev.signature[:8]}… mint={ev.mint} bc={ev.bonding_curve}")
                         asyncio.create_task(engine.buy_on_create(ev, SOL_TO_SPEND, SLIPPAGE_BPS))
+
                     except Exception as e:
-                        # Keep going even if one decode fails
-                        print(f"[{now_ms()}] [decode_err] {e!s}")
+                        # Use debug gate; avoid noisy prints on the hot path
+                        dbg(f"[{now_ms()}] [decode_err] {e!s}")
+                        continue
+
         except Exception as e:
             print(f"[{now_ms()}] [ws_err] {e!s}  (reconnect in 2s)")
             await asyncio.sleep(2.0)

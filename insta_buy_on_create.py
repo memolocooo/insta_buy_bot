@@ -41,6 +41,11 @@ def now_ms() -> str:
     t = time.time()
     return time.strftime("%H:%M:%S", time.localtime(t)) + f".{int((t % 1)*1000):03d}"
 
+VERBOSE = os.getenv("VERBOSE", "0") == "1"
+def dbg(msg: str):
+    if VERBOSE:
+        print(msg)
+
 def b58_keypair_from_secret(secret_b58: str) -> Keypair:
     sk = base58.b58decode(secret_b58)
     return Keypair.from_bytes(sk)
@@ -310,7 +315,9 @@ async def listen_and_buy():
                 ping_interval=15,
                 ping_timeout=10,
                 max_size=None,
-                close_timeout=1
+                close_timeout=1,
+                compression=None,    # <—
+                max_queue=1
             ) as ws:
                 await ws.send(json.dumps(sub))
                 _ = await ws.recv()  # subscription ack
@@ -318,30 +325,23 @@ async def listen_and_buy():
                 print(f"[{now_ms()}] [create] listening @ {WSS_ENDPOINT} (processed)")
                 while True:
                     raw = await ws.recv()
-                    msg = json.loads(raw)
-                    if msg.get("method") != "logsNotification":
+                    # Pre-filter cheap string patterns to skip JSON parsing for irrelevant messages
+                    s = raw if isinstance(raw, str) else raw.decode("utf-8", "ignore")
+                    if '"logsNotification"' not in s or 'Program log: Instruction: Create' not in s:
                         continue
+
+                    # Only now do the heavier JSON parse
+                    msg = json.loads(s)
+
 
                     value = msg["params"]["result"]["value"]
                     logs = value.get("logs", [])
 
-                    # Very fast pre-filter
-                    fast_hit = False
-                    for line in logs:
-                        if "Program log: Instruction: Create" in line:
-                            fast_hit = True
-                            break
-                    if not fast_hit:
-                        continue
-
-                    # Find base64 "Program data:"
-                    encoded = None
-                    for line in logs:
-                        if "Program data:" in line:
-                            encoded = line.split(": ", 1)[1]
-                            break
+                    # We already pre-filtered the raw message; just grab the encoded data
+                    encoded = next((ln.split(": ", 1)[1] for ln in logs if ln.startswith("Program data: ")), None)
                     if not encoded:
                         continue
+
 
                     try:
                         decoded = base64.b64decode(encoded)

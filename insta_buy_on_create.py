@@ -6,11 +6,10 @@ import struct
 import time
 from dataclasses import dataclass
 from typing import Optional, Dict, Any
-
 import base58
 import websockets
 from dotenv import load_dotenv
-
+import httpx
 from solders.keypair import Keypair
 from solders.rpc.config import RpcSendTransactionConfig
 from solders.rpc.responses import SendTransactionResp
@@ -31,6 +30,8 @@ SLIPPAGE_BPS = int(os.getenv("SLIPPAGE_BPS", "100"))  # 1.00%
 CU_PRICE_MICROLAMPORTS = int(os.getenv("CU_PRICE_MICROLAMPORTS", "2500"))  # priority fee per CU
 COMPUTE_UNIT_LIMIT = int(os.getenv("COMPUTE_UNIT_LIMIT", "600000"))
 DRY_RUN = os.getenv("DRY_RUN", "false").lower() == "true"
+JITO_URL = os.getenv("JITO_URL", "https://ny.mainnet.block-engine.jito.wtf/api/v1/transactions")
+JITO_AUTH = os.getenv("JITO_AUTH")  # optional UUID token; not required for default rate limits
 
 # Pump.fun program id
 PUMP_PROGRAM_ID = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
@@ -89,6 +90,43 @@ def _tx_to_bytes(tx) -> bytes:
     raise RuntimeError("Unsupported transaction object; cannot serialize to bytes.")
 
 
+async def send_via_jito(base64_tx: str) -> str:
+    """POST to Jito block engine; returns signature on success."""
+    body = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "sendTransaction",
+        "params": [base64_tx, {"encoding": "base64"}]
+    }
+    headers = {"Content-Type": "application/json"}
+    if JITO_AUTH:
+        headers["x-jito-auth"] = JITO_AUTH
+
+    async with httpx.AsyncClient(timeout=2.0) as http:
+        r = await http.post(JITO_URL, json=body, headers=headers)
+        r.raise_for_status()
+        data = r.json()
+        if "error" in data:
+            raise RuntimeError(f"Jito error: {data['error']}")
+        sig = data.get("result") or data.get("value")
+        if not sig:
+            raise RuntimeError(f"Jito unexpected response: {data}")
+        return str(sig)
+
+
+
+def _tx_to_bytes(tx) -> bytes:
+    if hasattr(tx, "serialize"):
+        return tx.serialize()  # solana-py VersionedTransaction
+    try:
+        return bytes(tx)       # solders VersionedTransaction
+    except Exception:
+        pass
+    if isinstance(tx, (bytes, bytearray)):
+        return bytes(tx)
+    raise RuntimeError("Unsupported transaction object; cannot serialize to bytes.")
+
+
 @dataclass
 class CreateEvent:
     signature: str
@@ -117,26 +155,56 @@ class BuyEngine:
         self.rpc_http = rpc_http
         self.kp = keypair
         self.client = AsyncClient(self.rpc_http, timeout=5)
+        self._http = httpx.AsyncClient(timeout=2.0, headers={"Content-Type": "application/json"})
         self._latest_blockhash = None
         self._alive = True
+
+    async def close(self):
+        self._alive = False
+        await self.client.close()
+        await self._http.aclose()
+
 
     async def start(self):
         # Background task to refresh recent blockhash (~ every 300ms)
         asyncio.create_task(self._refresh_blockhash_loop())
 
-    async def close(self):
-        self._alive = False
-        await self.client.close()
 
     async def _refresh_blockhash_loop(self):
         while self._alive:
             try:
                 res = await self.client.get_latest_blockhash(Processed)
                 if res.value:
-                    self._latest_blockhash = res.value.blockhash
+                    self._latest_blockhash = res.value.blockhash  # keep as solders.Hash
             except Exception:
                 pass
-            await asyncio.sleep(0.3)
+            await asyncio.sleep(0.15)  # was 0.3 — tighter refresh
+
+    
+    async def send_via_rpc(self, raw_tx: bytes) -> str:
+        resp = await self.client.send_raw_transaction(
+            raw_tx,
+            opts=TxOpts(skip_preflight=True, preflight_commitment=Processed, max_retries=0)
+        )
+        sig = getattr(resp, "value", None) or getattr(resp, "result", None) or resp
+        return str(sig)
+
+    async def send_via_jito(self, base64_tx: str) -> str:
+        body = {
+            "jsonrpc": "2.0", "id": 1, "method": "sendTransaction",
+            "params": [base64_tx, {"encoding": "base64"}]
+        }
+        headers = {}
+        if JITO_AUTH:
+            headers["x-jito-auth"] = JITO_AUTH
+        r = await self._http.post(JITO_URL, json=body, headers=headers)
+        r.raise_for_status()
+        data = r.json()
+        if "error" in data:
+            raise RuntimeError(f"Jito error: {data['error']}")
+        return str(data.get("result") or data.get("value"))
+
+
 
     async def buy_on_create(self, ev: CreateEvent, sol_amount: float, slippage_bps: int) -> Optional[str]:
         lamports = int(sol_amount * 1_000_000_000)
@@ -173,18 +241,47 @@ class BuyEngine:
             )
 
         # Fire-and-forget fast send; skip preflight for speed.
-        raw = _tx_to_bytes(tx)  # VersionedTransaction is bytes-like
-        try:
-            resp = await self.client.send_raw_transaction(
-                raw,
-                opts=TxOpts(skip_preflight=True, preflight_commitment=Processed, max_retries=0)
-            )
-            sig = str(resp.value) if hasattr(resp, "value") else str(resp)
-            print(f"[{now_ms()}] [BUY→SENT] {sig}  mint={ev.mint}  {sol_amount} SOL")
-            return sig
-        except Exception as e:
-            print(f"[{now_ms()}] [BUY→ERROR] {e!s}")
-            return None
+                # Fire-and-forget fast send; skip preflight for speed.
+        t0 = time.perf_counter()
+
+        raw = _tx_to_bytes(tx)
+        b64 = base64.b64encode(raw).decode("ascii")
+
+        rpc_task  = asyncio.create_task(self.send_via_rpc(raw))
+        jito_task = asyncio.create_task(self.send_via_jito(b64))
+
+        done, pending = await asyncio.wait({rpc_task, jito_task}, return_when=asyncio.FIRST_COMPLETED)
+
+        winner = None
+        sig = None
+        for t in done:
+            try:
+                sig = await t
+                winner = "RPC" if t is rpc_task else "JITO"
+                break
+            except Exception:
+                pass
+
+        if sig is None:
+            # await the other if first finisher errored
+            remaining = list(pending)
+            if remaining:
+                try:
+                    sig = await remaining[0]
+                    winner = "RPC" if remaining[0] is rpc_task else "JITO"
+                except Exception as e:
+                    print(f"[{now_ms()}] [BUY→ERROR] rpc+jito both failed: {e!s}")
+                    return None
+
+        # Cancel the slower path
+        for p in pending:
+            p.cancel()
+
+        dt_ms = int((time.perf_counter() - t0) * 1000)
+        print(f"[{now_ms()}] [BUY→SENT][{winner}] {sig}  mint={ev.mint}  {sol_amount} SOL  ({dt_ms}ms send)")
+        return sig
+
+
 
 # -------- LISTENER --------
 async def listen_and_buy():
